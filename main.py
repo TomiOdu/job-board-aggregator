@@ -12,10 +12,11 @@ from datetime import date
 from dotenv import load_dotenv
 
 import config
-from core import storage
+from core import metrics, quality, storage
 from core.dedupe import merge_with_master
 from core.filters import apply_filters
 from core.logging_setup import setup_logging
+from core.metrics import RunMetrics, SourceMetrics
 from core.models import JobListing
 from sources import AuthError, SearchQuery, SourceError, build_sources
 
@@ -92,14 +93,19 @@ def run(only_sources: list[str] | None = None, dry_run: bool = False) -> int:
         logger.error("No sources selected - nothing to do")
         return 1
 
+    run_metrics = RunMetrics()
     fetched: list[JobListing] = []
     failures = 0
 
     for source in sources:
+        stats = SourceMetrics(name=source.name)
+        run_metrics.add_source(stats)
+
         if not source.is_configured():
             logger.warning(
                 "[%s] skipped - credentials not set (see .env.example)", source.name
             )
+            stats.configured = False
             failures += 1
             continue
 
@@ -107,8 +113,14 @@ def run(only_sources: list[str] | None = None, dry_run: bool = False) -> int:
             listings, rejected, attempted, failed = collect_from_source(source)
         except Exception as exc:  # noqa: BLE001 - one source must never kill the run
             logger.exception("[%s] failed entirely: %s", source.name, exc)
+            stats.failed = True
             failures += 1
             continue
+
+        stats.queries_attempted = attempted
+        stats.queries_failed = failed
+        stats.listings_kept = len(listings)
+        stats.rejected_by_filter = rejected
 
         # Every query erroring is a failure, not an empty result set. Without
         # this the run exits 0 having quietly fetched nothing.
@@ -116,6 +128,7 @@ def run(only_sources: list[str] | None = None, dry_run: bool = False) -> int:
             logger.error(
                 "[%s] all %d queries failed - treating the source as failed", source.name, attempted
             )
+            stats.failed = True
             failures += 1
             continue
 
@@ -127,6 +140,9 @@ def run(only_sources: list[str] | None = None, dry_run: bool = False) -> int:
 
     if failures == len(sources):
         logger.error("Every source failed or was unconfigured - not touching the dataset")
+        run_metrics.quality_status = "not_run"
+        if not dry_run:
+            metrics.append_run(run_metrics, config.RUN_HISTORY_CSV)
         return 1
 
     existing = storage.load_master(config.MASTER_CSV)
@@ -141,11 +157,26 @@ def run(only_sources: list[str] | None = None, dry_run: bool = False) -> int:
     if len(new_today) > 10:
         logger.info("  ... and %d more", len(new_today) - 10)
 
+    run_metrics.new_today = len(new_today)
+    run_metrics.total_in_dataset = len(full)
+
+    # Quality gate runs before anything is written, so a failure leaves the
+    # previous good dataset in place rather than overwriting it with bad data.
+    logger.info("Running data quality checks...")
+    results = quality.run_all(full, previous_count=len(existing), today=today_iso)
+    safe_to_write, status = quality.report(results)
+    run_metrics.quality_status = status
+
     if dry_run:
         logger.info("Dry run - no files written")
-        return 0
+        return 0 if safe_to_write else 1
+
+    if not safe_to_write:
+        metrics.append_run(run_metrics, config.RUN_HISTORY_CSV)
+        return 1
 
     storage.write_outputs(full, new_today, today)
+    metrics.append_run(run_metrics, config.RUN_HISTORY_CSV)
     return 0
 
 

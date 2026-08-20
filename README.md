@@ -1,12 +1,54 @@
-# UK Data / Analytics Engineering job aggregator
+# UK Data / Analytics Engineering job pipeline
 
-Pulls Data Engineering and Analytics Engineering vacancies in London (plus
-remote-UK roles) from job board APIs once a day, deduplicates them into a
-running dataset, and writes Excel and CSV outputs.
+An incremental ETL pipeline that aggregates Data Engineering and Analytics
+Engineering vacancies (London + remote-UK) from multiple job board APIs into a
+deduplicated historical dataset, on a daily schedule, with no infrastructure to
+run.
 
-- **Sources:** Adzuna, Reed (more can be added — see [Adding a source](#adding-a-source))
-- **Schedule:** daily at 06:00 UTC via GitHub Actions, plus a manual trigger
-- **Outputs:** a full running list and a "new today" list, as `.xlsx` and `.csv`
+Each run extracts from every configured source, resolves the same role appearing
+across sources into a single record, merges it into an append-only dataset that
+tracks when each listing was first and last seen, validates the result, and
+publishes Excel and CSV outputs.
+
+| | |
+|---|---|
+| **Sources** | Adzuna, Reed — pluggable, see [Adding a source](#adding-a-source) |
+| **Schedule** | Daily 06:00 UTC on GitHub Actions, plus a manual trigger |
+| **Load pattern** | Incremental and idempotent — re-running a day is a no-op |
+| **Deduplication** | Deterministic key across sources; ~50% of fetched rows collapse |
+| **Quality** | Six checks gate every write; failures preserve the last good dataset |
+| **Observability** | Per-run metrics appended to `data/run_history.csv` |
+| **Tests** | 60, including regressions for bugs found in live data |
+
+---
+
+## Architecture
+
+```mermaid
+flowchart TD
+    A1[Adzuna API] --> E
+    A2[Reed API] --> E
+    A3[Future source] -.-> E
+
+    E["<b>Extract</b><br/>JobSource adapters<br/>retries, backoff, auth handling"] --> F
+    F["<b>Filter</b><br/>strict title match<br/>remote detection"] --> D
+    D["<b>Resolve</b><br/>deterministic job_id<br/>cross-source dedupe"] --> M
+    M["<b>Merge</b><br/>append-only<br/>first_seen / last_seen"] --> Q
+
+    Q{"<b>Quality gate</b><br/>6 checks"}
+    Q -->|pass| W["<b>Publish</b><br/>xlsx + csv + archive"]
+    Q -->|fail| K["Abort write<br/>previous dataset survives"]
+
+    W --> H[(run_history.csv)]
+    K --> H
+
+    S[(job_listings_master.csv)] -.->|previous state| M
+    W --> S
+```
+
+The dataset itself is the state store — each run reads the previous
+`job_listings_master.csv` to determine what is genuinely new. That is what
+makes `first_seen_date` meaningful and the run idempotent.
 
 ---
 
@@ -132,6 +174,7 @@ which are the bulk of the growth.
 | `data/job_listings_latest.xlsx` | Two sheets: **All Jobs** and **New Today** |
 | `data/job_listings_new_today.csv` | Just the listings first seen on this run |
 | `data/archive/job_listings_YYYY-MM-DD.xlsx` | Dated snapshot per run |
+| `data/run_history.csv` | One row per run — see [Run history](#run-history) |
 
 The Excel file has a bold frozen header row, autofilter, sensible column
 widths, thousands-separated salaries and clickable URLs. CSVs are written with
@@ -182,6 +225,80 @@ Worth knowing before you trust a column:
 - **Reed contract type is inferred** from the advert text, because Reed's
   search endpoint omits it and fetching it properly would cost one extra API
   call per listing. Blank means no clear signal, not "not specified".
+
+---
+
+## Data quality gate
+
+Every write is gated. The checks run **after** the merge and **before** any file
+is touched, so a fatal failure leaves the previous good dataset intact rather
+than overwriting it with bad data — the failure mode that matters when nobody is
+watching a scheduled job.
+
+| Check | Severity | Catches |
+|---|---|---|
+| `no_duplicate_ids` | **fatal** | Broken dedupe double-counting rows |
+| `required_fields` | **fatal** | Rows with no title, URL, id or dates |
+| `row_count_stable` | **fatal** below 50% | A source returning garbage, or a truncated master file |
+| `salary_ranges` | warn | Figures in the wrong period bucket (a day rate labelled annual) |
+| `dates_sane` | warn | Future posting dates, `first_seen` after `last_seen` |
+| `urls_usable` | warn | Malformed links in the column the whole output exists for |
+
+Warnings are logged and the run continues. A fatal failure exits non-zero, which
+turns the Actions run red. Thresholds live in `config.py`.
+
+---
+
+## Run history
+
+Each run appends a row to `data/run_history.csv`, so pipeline behaviour is
+visible over time rather than only in the logs of whichever run you happen to
+open:
+
+```
+run_date, duration_seconds, sources_run, sources_failed, fetched_post_filter,
+rejected_by_filter, new_today, total_in_dataset, quality_status,
+adzuna_kept, adzuna_queries_failed, adzuna_status, reed_kept, ...
+```
+
+Useful for spotting a source silently degrading (its `*_kept` count drifting
+down), runs getting slower, or the quality gate tripping repeatedly. Adding a
+new source widens the file rather than breaking its schema, so old rows stay
+readable.
+
+---
+
+## Design decisions
+
+**Why hash the content instead of using the boards' own job IDs.**
+Adzuna and Reed issue unrelated IDs for the same advert, so board IDs would put
+every cross-source duplicate in the sheet twice — and Adzuna alone issues
+several IDs for one syndicated advert. A hash of title + company + coarse
+location collapses them. The trade-off is that an edited advert gets a new ID
+and reappears as new; retitles are rarer than duplicates, so the hash wins.
+
+**Why the dataset is the state store.**
+There is no database. Each run reads the previous master CSV, merges, and writes
+it back, with git providing history. At this volume (~200 rows/day) a database
+would be infrastructure to maintain for no gain, and the CSV diffs readably in
+a pull request.
+
+**Why GitHub Actions rather than an orchestrator.**
+Cron on Actions is the right size for one daily task with no inter-task
+dependencies. Airflow or Dagster would earn their place once there were
+backfills to run, dependencies between assets, or per-task retries — none of
+which exist here.
+
+**Why the quality gate blocks the write rather than warning.**
+A scheduled pipeline nobody watches fails silently by default. Refusing to write
+means the worst case is a stale dataset and a red build, instead of a
+successfully-overwritten broken one.
+
+**Why one source failing never fails the run.**
+Sources are independent, so a Reed outage should not cost you Adzuna's listings.
+The run only exits non-zero when *every* source fails — a distinction that
+matters, because "found nothing" and "everything errored" otherwise look
+identical in the output.
 
 ---
 
@@ -282,6 +399,8 @@ core/
   salary.py               Salary parsing and normalisation
   filters.py              Strict title matching, remote detection
   dedupe.py               job_id hashing, merge into the running dataset
+  quality.py              Pre-write data quality gate
+  metrics.py              Per-run metrics -> run_history.csv
   storage.py              CSV/Excel reading and writing, Excel formatting
   logging_setup.py        Console + rotating file logging
 tests/                    Unit tests for parsing, filtering, dedupe, failure modes
@@ -301,3 +420,4 @@ data/                     Outputs (committed)
 | Everything looks new after a gap | `job_listings_master.csv` missing or not committed |
 | `£` shows as `Â£` in Excel | Opening an older CSV written before the BOM fix — rerun |
 | No listings at all | Title filter too strict; check `--verbose` output |
+| Run exits 1, `quality_status=failed` | A fatal check tripped — the log names it; the dataset was left untouched |

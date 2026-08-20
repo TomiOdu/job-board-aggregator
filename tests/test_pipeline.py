@@ -199,6 +199,73 @@ def test_estimate_does_not_overwrite_a_real_salary():
     assert full[0].salary_is_estimate is False
 
 
+def test_advertised_day_rate_beats_an_annualised_one():
+    """Real case: Adzuna reports 169000/yr for a role Reed reports as 650/day."""
+    known = listing(source="Adzuna", salary_min=169000, salary_max=169000,
+                    salary_period="annual")
+    known.job_id = make_job_id(known)
+    known.first_seen_date = known.last_seen_date = "2026-08-19"
+
+    incoming = listing(source="Reed", salary_min=650, salary_max=650,
+                       salary_period="daily")
+    full, _ = merge_with_master([known], [incoming], today="2026-08-20")
+
+    assert full[0].salary_min == 650
+    assert full[0].salary_period == "daily"
+
+
+def test_annual_salary_is_not_replaced_by_another_annual():
+    known = listing(salary_min=70000, salary_max=80000, salary_period="annual")
+    known.job_id = make_job_id(known)
+    known.first_seen_date = known.last_seen_date = "2026-08-19"
+
+    incoming = listing(salary_min=65000, salary_max=75000, salary_period="annual")
+    full, _ = merge_with_master([known], [incoming], today="2026-08-20")
+
+    assert full[0].salary_min == 70000     # first one wins, no churn
+
+
 def test_duplicates_within_one_batch_collapse():
     _, new_today = merge_with_master([], [listing(), listing(), listing()], today="2026-08-20")
     assert len(new_today) == 1
+
+
+def test_second_run_same_day_still_reports_the_whole_day():
+    """A manual run after the scheduled one must not shrink 'new today' to its
+    own delta - the file would lose everything found that morning."""
+    morning = listing(title="Data Engineer", url="https://example.com/1")
+    full_am, new_am = merge_with_master([], [morning], today="2026-08-20")
+    assert len(new_am) == 1
+
+    afternoon = listing(title="Analytics Engineer", url="https://example.com/2")
+    _, new_pm = merge_with_master(full_am, [morning, afternoon], today="2026-08-20")
+
+    assert len(new_pm) == 2                                   # not just the new one
+    assert {l.title for l in new_pm} == {"Data Engineer", "Analytics Engineer"}
+
+
+def test_day_rate_wins_within_a_single_run_too():
+    """The within-run path collapses duplicates before the master merge, so it
+    needs the same salary preference - otherwise source order decides."""
+    adzuna = listing(source="Adzuna", salary_min=169000, salary_max=169000,
+                     salary_period="annual")
+    reed = listing(source="Reed", salary_min=650, salary_max=650,
+                   salary_period="daily")
+
+    _, new_today = merge_with_master([], [adzuna, reed], today="2026-08-20")
+
+    assert len(new_today) == 1
+    assert new_today[0].salary_min == 650
+    assert new_today[0].salary_period == "daily"
+
+
+def test_real_salary_wins_within_a_single_run():
+    estimated = listing(source="Adzuna", salary_min=50000, salary_max=50000,
+                        salary_period="annual", salary_is_estimate=True)
+    advertised = listing(source="Reed", salary_min=72000, salary_max=80000,
+                         salary_period="annual", salary_is_estimate=False)
+
+    _, new_today = merge_with_master([], [estimated, advertised], today="2026-08-20")
+
+    assert new_today[0].salary_min == 72000
+    assert new_today[0].salary_is_estimate is False

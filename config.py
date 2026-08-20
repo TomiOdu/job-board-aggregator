@@ -95,6 +95,25 @@ LOG_DIR = ROOT / "logs"
 MASTER_CSV = DATA_DIR / "job_listings_master.csv"
 LATEST_XLSX = DATA_DIR / "job_listings_latest.xlsx"
 NEW_TODAY_CSV = DATA_DIR / "job_listings_new_today.csv"
+RUN_HISTORY_CSV = DATA_DIR / "run_history.csv"
+
+
+# --------------------------------------------------------------------------
+# Data quality gate
+#
+# Fatal failures abort the write so the previous good dataset survives.
+# --------------------------------------------------------------------------
+
+# Fail if the merged dataset drops below this fraction of the previous run.
+QUALITY_MIN_ROW_RETENTION = 0.5
+
+# Plausible bounds per salary period; anything outside is flagged as a warning,
+# usually meaning a figure landed in the wrong period bucket.
+QUALITY_SALARY_BOUNDS = {
+    "annual": (10_000, 500_000),
+    "daily": (50, 3_000),
+    "hourly": (5, 500),
+}
 
 # Write a dated copy of the workbook into data/archive/ on each run.
 WRITE_ARCHIVE_COPY = True

@@ -81,20 +81,58 @@ def make_job_id(listing: JobListing) -> str:
     return hashlib.sha1(basis.encode("utf-8")).hexdigest()[:16]
 
 
+def improve_salary(known: JobListing, incoming: JobListing) -> None:
+    """Adopt `incoming`'s salary if it describes the job better than `known`'s.
+
+    Applied whenever two records collapse into one, whether that happens
+    within a single run or against the stored dataset.
+    """
+    if incoming.salary_min is None:
+        return
+
+    missing = known.salary_min is None
+    # An advertiser's figure always beats a board's own prediction.
+    upgrade = known.salary_is_estimate and not incoming.salary_is_estimate
+    # Some boards annualise contract day rates (650/day -> 169,000/yr). When
+    # two sources describe one job both ways, the day rate is what the advert
+    # actually said, so it wins over the derived figure.
+    as_advertised = (
+        known.salary_period == "annual"
+        and incoming.salary_period in ("daily", "hourly")
+    )
+
+    if missing or upgrade or as_advertised:
+        known.salary_min = incoming.salary_min
+        known.salary_max = incoming.salary_max
+        known.salary_currency = incoming.salary_currency
+        known.salary_period = incoming.salary_period
+        known.salary_is_estimate = incoming.salary_is_estimate
+        known.salary_raw = incoming.salary_raw
+
+
 def dedupe_batch(listings: list[JobListing]) -> list[JobListing]:
-    """Collapse duplicates within a single run, keeping the first occurrence."""
-    seen_ids: set[str] = set()
-    seen_urls: set[str] = set()
+    """Collapse duplicates within a single run.
+
+    Keeps the first occurrence as the surviving row, but still lets a later
+    duplicate contribute a better salary - otherwise whichever source happens
+    to run first silently wins.
+    """
+    kept_by_id: dict[str, JobListing] = {}
+    url_index: dict[str, str] = {}
     unique: list[JobListing] = []
 
     for listing in listings:
         listing.job_id = listing.job_id or make_job_id(listing)
         url_key = normalise_url(listing.url)
-        if listing.job_id in seen_ids or (url_key and url_key in seen_urls):
+
+        known_id = listing.job_id if listing.job_id in kept_by_id else url_index.get(url_key, "")
+        if known_id:
+            improve_salary(kept_by_id[known_id], listing)
             continue
-        seen_ids.add(listing.job_id)
+
+        kept_by_id[listing.job_id] = listing
         if url_key:
-            seen_urls.add(url_key)
+            url_index[url_key] = listing.job_id
         unique.append(listing)
 
     return unique
@@ -119,8 +157,6 @@ def merge_with_master(
         if url_key:
             url_index[url_key] = listing.job_id
 
-    new_today: list[JobListing] = []
-
     for listing in dedupe_batch(fetched):
         url_key = normalise_url(listing.url)
         known_id = listing.job_id if listing.job_id in by_id else url_index.get(url_key, "")
@@ -128,17 +164,7 @@ def merge_with_master(
         if known_id:
             known = by_id[known_id]
             known.last_seen_date = today
-            # Fill in a salary we did not have, and always prefer an
-            # advertiser-published figure over a board's estimate.
-            missing = known.salary_min is None
-            upgrade = known.salary_is_estimate and not listing.salary_is_estimate
-            if listing.salary_min is not None and (missing or upgrade):
-                known.salary_min = listing.salary_min
-                known.salary_max = listing.salary_max
-                known.salary_currency = listing.salary_currency
-                known.salary_period = listing.salary_period
-                known.salary_is_estimate = listing.salary_is_estimate
-                known.salary_raw = listing.salary_raw
+            improve_salary(known, listing)
             continue
 
         listing.first_seen_date = today
@@ -146,11 +172,14 @@ def merge_with_master(
         by_id[listing.job_id] = listing
         if url_key:
             url_index[url_key] = listing.job_id
-        new_today.append(listing)
 
     full = sorted(
         by_id.values(),
         key=lambda item: (item.first_seen_date, item.date_posted, item.title),
         reverse=True,
     )
+    # Derived from first_seen_date rather than "added by this run", so running
+    # twice in a day still reports everything found today instead of just the
+    # second run's delta.
+    new_today = [item for item in full if item.first_seen_date == today]
     return full, new_today
