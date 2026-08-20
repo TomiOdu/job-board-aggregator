@@ -1,0 +1,99 @@
+name: Daily job scrape
+
+on:
+  schedule:
+    # 06:00 UTC = 07:00 BST (Mar-Oct) / 06:00 GMT (Oct-Mar). GitHub cron is
+    # always UTC, so the UK wall-clock time shifts by an hour in winter.
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Fetch and report, but write no files"
+        type: boolean
+        default: false
+      verbose:
+        description: "Debug logging"
+        type: boolean
+        default: false
+
+# Needed for the bot to push the updated dataset back to the repo.
+permissions:
+  contents: write
+
+# A manual run and the nightly run must not push at the same time.
+concurrency:
+  group: daily-jobs
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          # Full history: the commit step rebases before pushing, which is
+          # unreliable against the default shallow clone.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run aggregator
+        env:
+          ADZUNA_APP_ID: ${{ secrets.ADZUNA_APP_ID }}
+          ADZUNA_APP_KEY: ${{ secrets.ADZUNA_APP_KEY }}
+          REED_API_KEY: ${{ secrets.REED_API_KEY }}
+          # Read into the shell rather than interpolated into the command, so
+          # the input can never be treated as script.
+          DRY_RUN: ${{ inputs.dry_run }}
+          VERBOSE: ${{ inputs.verbose }}
+        run: |
+          args=""
+          [ "$DRY_RUN" = "true" ] && args="$args --dry-run"
+          [ "$VERBOSE" = "true" ] && args="$args --verbose"
+          python main.py $args
+
+      - name: Commit updated dataset
+        if: ${{ inputs.dry_run != true }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Update job listings ($(date -u '+%Y-%m-%d'))"
+            # Re-sync in case something else landed on the branch meanwhile.
+            git pull --rebase --autostash origin "${GITHUB_REF_NAME}"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
+
+      - name: Upload outputs as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: job-listings
+          path: |
+            data/job_listings_latest.xlsx
+            data/job_listings_master.csv
+            data/job_listings_new_today.csv
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Upload run log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-log
+          path: logs/run.log
+          retention-days: 14
+          if-no-files-found: ignore
