@@ -1,2 +1,3 @@
 ﻿run_id,run_date,started_at_utc,duration_seconds,sources_run,sources_failed,fetched_post_filter,rejected_by_filter,new_today,total_in_dataset,quality_status,adzuna_kept,adzuna_queries_failed,adzuna_status,reed_kept,reed_queries_failed,reed_status
 20260820T112243Z,2026-08-20,2026-08-20 11:22:43,14.5,2,0,199,381,108,108,passed,108,0,ok,91,0,ok
+20260821T063508Z,2026-08-21,2026-08-21 06:35:08,13.5,2,0,194,386,18,126,passed,105,0,ok,89,0,ok
